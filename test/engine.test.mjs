@@ -1,7 +1,7 @@
 // test/engine.test.mjs — 屏障、缓存、恢复与错误边界
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { replay, finalState, ValidationError, MAX_CHANNELS, MAX_EVENTS } from '../src/engine.mjs';
+import { replay, finalState, ValidationError, MAX_CHANNELS, MAX_EVENTS, sourceBreakdown } from '../src/engine.mjs';
 
 const D = (channel, seq, value) => ({ type: 'data', channel, seq, value });
 const B = (channel, checkpoint) => ({ type: 'barrier', channel, checkpoint });
@@ -294,4 +294,181 @@ test('Worker 同构持久化回放（内存存储）：崩溃后存储中确无 
   assert.ok(!mem.has('intent:cp2:ch1'));
   // finalState 便捷 API
   assert.equal(finalState({ channels: 2, events: [D(1, 1, 10), D(2, 1, 5)] }).total, 15);
+});
+
+// ---------- 累计值来源分解 ----------
+
+test('来源分解：无故障整段，封存部分 + 检查点后实际纳入 = 当前累计（按通道）', () => {
+  const plan = {
+    channels: 2,
+    events: [D(1, 1, 10), D(2, 1, 1), B(1, 1), B(2, 1), D(1, 2, 5), D(2, 2, 2)],
+  };
+  const r = replay(plan);
+  const last = r.frames.length - 1;
+  const bd = sourceBreakdown(r, 1, last);
+  assert.ok(bd.ok, '应成功：' + bd.reason);
+  assert.equal(bd.sealedTotal, 11);
+  assert.equal(bd.postTotal, 7);
+  assert.equal(bd.combinedTotal, 18);
+  assert.equal(bd.currentTotal, 18);
+  assert.ok(bd.matches);
+  assert.equal(bd.recoveredFrom, false);
+  const ch1 = bd.channels.find((x) => x.channel === 1);
+  assert.deepEqual(ch1.sealed.range, { first: 1, last: 1 });
+  assert.deepEqual(ch1.post.seqOrder, [2]);
+  assert.deepEqual(ch1.post.items, [{ seq: 2, value: 5 }]);
+  assert.equal(ch1.sealed.total, 10);
+  assert.equal(ch1.post.total, 5);
+  assert.ok(ch1.matches);
+  const ch2 = bd.channels.find((x) => x.channel === 2);
+  assert.deepEqual(ch2.post.seqOrder, [2]);
+});
+
+test('来源分解：封存当帧 post 为 0；缓存未释放时拒绝分解该检查点（尚未完整可见）', () => {
+  const plan = {
+    channels: 2,
+    events: [D(1, 1, 10), B(1, 1), D(1, 2, 7), D(2, 1, 3), D(1, 3, 4), B(2, 1), D(2, 2, 2)],
+  };
+  const r = replay(plan);
+  // 步骤 #5（对齐帧）：快照已发布且缓存同帧释放 -> post 含释放项
+  const atSeal = sourceBreakdown(r, 1, 5);
+  assert.ok(atSeal.ok, atSeal.reason);
+  assert.equal(atSeal.sealedTotal, 13);
+  assert.deepEqual(atSeal.channels.find((x) => x.channel === 1).post.seqOrder, [2, 3]);
+  assert.equal(atSeal.postTotal, 11);
+  assert.ok(atSeal.matches);
+  // 步骤 #2：cp1 尚未对齐发布，必须返回明确原因且无旧分解
+  const early = sourceBreakdown(r, 1, 2);
+  assert.equal(early.ok, false);
+  assert.equal(early.code, 'CHECKPOINT_INCOMPLETE');
+});
+
+test('来源分解：另一检查点对齐中被缓存的数据（未释放）不出现在任一部分', () => {
+  const plan = {
+    channels: 3,
+    events: [
+      D(1, 1, 1), D(2, 1, 2), D(3, 1, 4),
+      B(1, 1), B(2, 1), B(3, 1),
+      D(1, 2, 10), D(2, 2, 20),
+      B(2, 2),
+      D(2, 3, 30), // 通道2 cp2 屏障先到 -> 缓存，既不属封存也不属 post
+      B(1, 2), B(3, 2),
+    ],
+  };
+  const r = replay(plan);
+  const bd = sourceBreakdown(r, 1, 9); // 最后一帧 cp2 刚对齐
+  assert.ok(bd.ok, bd.reason);
+  const ch2 = bd.channels.find((x) => x.channel === 2);
+  assert.deepEqual(ch2.bufferedSeqs, [3]);
+  assert.deepEqual(ch2.post.seqOrder, [2]);
+  assert.equal(ch2.post.total, 20);
+  assert.equal(bd.sealedTotal, 7);
+  assert.equal(bd.postTotal, 30);
+  assert.equal(bd.combinedTotal, 37);
+  assert.equal(bd.currentTotal, 37);
+  assert.ok(bd.matches);
+});
+
+test('来源分解：所选步骤早于检查点封存步骤 -> STEP_BEFORE_CHECKPOINT（防御性）', () => {
+  const plan = { channels: 2, events: [D(1, 1, 1), B(1, 1), B(2, 1)] };
+  const r = replay(plan);
+  // frame.checkpoints 中快照 sealedAtEventIndex=2；构造 step=2 之前不可达，
+  // 这里通过直接调用验证 step<sealedAt 的防御分支
+  const snap = r.frames[2].checkpoints[0];
+  assert.equal(snap.sealedAtEventIndex, 2);
+  const fake = {
+    channels: 2,
+    frames: [
+      // 帧 0 人为带一份 sealedAt=2 的已发布快照（模拟数据异常）
+      { index: 0, alive: true, crashed: false, event: {}, checkpoints: [snap],
+        perChannel: [0, 1, 0], total: 1, buffered: [], appliedSnapshot: [[], [{ seq: 1, value: 1 }], []] },
+    ],
+  };
+  const bd = sourceBreakdown(fake, 1, 0);
+  assert.equal(bd.ok, false);
+  assert.equal(bd.code, 'STEP_BEFORE_CHECKPOINT');
+});
+
+test('来源分解：快照阶段故障并重开后，只能分解恢复采用的完整检查点', () => {
+  const plan = {
+    channels: 2,
+    events: [
+      D(1, 1, 10), D(2, 1, 5), B(1, 1), B(2, 1),
+      D(1, 2, 9), C('snapshot'), B(2, 2), B(1, 2),
+      R(), D(1, 2, 9), B(2,2), B(1,2), D(2, 2, 6),
+    ],
+  };
+  const r = replay(plan);
+  const crashIdx = r.frames.findIndex((f) => f.crashed);
+  const last = r.frames.length - 1;
+
+  // 故障冻结帧：任何检查点都不分解
+  for (const cp of [1, 2]) {
+    const bd = sourceBreakdown(r, cp, crashIdx);
+    assert.equal(bd.ok, false, `冻结帧不应分解 cp${cp}`);
+    assert.equal(bd.code, 'STEP_FROZEN');
+  }
+  // 故障后、重开前被上游暂存的帧（alive=false 但 crashed 字段未必为 true）同样冻结
+  const skipped = r.frames.find((f) => f.skippedDead);
+  if (skipped) assert.equal(sourceBreakdown(r, 1, skipped.index).code, 'STEP_FROZEN');
+
+  // 半完成 cp2 在故障帧的 checkpoints 中只有 cp1（半成品永不出现）
+  assert.deepEqual(r.frames[crashIdx].checkpoints.map((c) => c.id), [1]);
+
+  // 重开后：只允许恢复采用的 cp1
+  const ok = sourceBreakdown(r, 1, last);
+  assert.ok(ok.ok, ok.reason);
+  assert.equal(ok.sealedTotal, 15);
+  assert.equal(ok.postTotal, 15); // 9 + 6；9 在故障前/重开后序号相同但只承认一次
+  assert.ok(ok.matches);
+  assert.equal(ok.recoveredFrom, true);
+  assert.deepEqual(ok.channels.find((x) => x.channel === 1).post.seqOrder, [2]);
+
+  const bad = sourceBreakdown(r, 2, last);
+  assert.equal(bad.ok, false);
+  assert.equal(bad.code, 'CHECKPOINT_NOT_RECOVERY');
+});
+
+test('来源分解：快照阶段故障后从空状态恢复时，拒绝任何检查点分解', () => {
+  const plan = {
+    channels: 2,
+    events: [D(1, 1, 3), C('snapshot'), B(1, 1), B(2, 1), R(), D(1, 1, 3), B(1, 1), B(2, 1)],
+  };
+  const r = replay(plan);
+  const bd = sourceBreakdown(r, 1, r.frames.length - 1);
+  assert.equal(bd.ok, false);
+  assert.equal(bd.code, 'NO_PUBLISHED_CHECKPOINT');
+});
+
+test('来源分解：意图阶段/立即故障不产生快照，重开后新发布检查点允许分解', () => {
+  const r = replay({
+    channels: 2,
+    events: [D(1, 1, 4), C('intent'), B(1, 1), R(), D(1, 1, 4), D(2, 1, 2), B(1, 1), B(2, 1)],
+  });
+  const bd = sourceBreakdown(r, 1, r.frames.length - 1);
+  assert.ok(bd.ok, bd.reason);
+  assert.equal(bd.sealedTotal, 6);
+  assert.equal(bd.postTotal, 0);
+  assert.ok(bd.matches);
+});
+
+test('来源分解：非法步骤/检查点编号返回明确错误码', () => {
+  const r = replay({ channels: 2, events: [D(1, 1, 1), B(1, 1), B(2, 1)] });
+  assert.equal(sourceBreakdown(r, 1, -1).code, 'BAD_STEP');
+  assert.equal(sourceBreakdown(r, 1, 99).code, 'BAD_STEP');
+  assert.equal(sourceBreakdown(r, 0, 2).code, 'BAD_CHECKPOINT');
+  assert.equal(sourceBreakdown(r, 9, 2).code, 'CHECKPOINT_INCOMPLETE');
+  assert.equal(sourceBreakdown(null, 1, 0).code, 'BAD_STEP');
+});
+
+test('来源分解：浮点累计核对不被截断，重开前后同序号不重复', () => {
+  const plan = {
+    channels: 2,
+    events: [D(1, 1, 0.1), D(2, 1, 0.2), B(1, 1), B(2, 1), D(1, 2, 0.3)],
+  };
+  const r = replay(plan);
+  const bd = sourceBreakdown(r, 1, r.frames.length - 1);
+  assert.ok(bd.ok, bd.reason);
+  assert.ok(Math.abs(bd.postTotal - 0.3) < 1e-9);
+  assert.ok(bd.matches, '浮点合计应与当前累计核对一致');
 });

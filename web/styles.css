@@ -131,4 +131,26 @@ body {
 .storage-kv .good { color: var(--ok); }
 .notes { margin: 0; padding-left: 18px; font-size: 12.5px; line-height: 1.65; }
 .notes li { margin-bottom: 3px; }
+
+/* 来源分解 */
+.breakdown-bar { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; font-size: 12.5px; color: var(--muted); }
+.breakdown-bar select { margin-left: 4px; background: var(--bg2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font-size: 12.5px; }
+.bd-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-bottom: 8px; }
+.bd-table th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+.bd-table td { padding: 5px 8px; border-bottom: 1px dashed rgba(35,72,95,.5); vertical-align: top; }
+.bd-table tr:last-child td { border-bottom: none; }
+.bd-seq { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: var(--accent); }
+.bd-items { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: var(--accent2); }
+.bd-num { text-align: right; font-weight: 600; white-space: nowrap; }
+.bd-sealed .bd-num { color: var(--purple); }
+.bd-post .bd-num { color: var(--accent2); }
+.bd-total { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: rgba(15,32,48,.6); font-size: 13px; }
+.bd-total .formula b { color: var(--accent2); }
+.bd-ok { color: var(--ok); font-weight: 700; }
+.bd-bad { color: var(--err); font-weight: 700; }
+.bd-reason { padding: 10px 12px; border: 1px solid var(--warn); background: rgba(251,191,36,.08); border-radius: 8px; color: #fde68a; font-size: 12.5px; }
+.bd-reason .code { color: var(--warn); font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+.bd-note { color: var(--muted); font-size: 11.5px; margin: 6px 2px 0; }
+.btn-mini { padding: 2px 8px; font-size: 11px; border-radius: 6px; }
+
 .foot { text-align: center; color: var(--muted); font-size: 11.5px; padding: 10px 0 22px; }

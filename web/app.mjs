@@ -1,5 +1,5 @@
-// app.mjs — 页面逻辑：事件编排、Worker 回放、单步查看
-import { replay, ValidationError, MAX_EVENTS } from './engine.mjs';
+// app.mjs — 页面逻辑：事件编排、Worker 回放、单步查看、累计值来源分解
+import { replay, ValidationError, MAX_EVENTS, sourceBreakdown } from './engine.mjs';
 
 const $ = (s) => document.querySelector(s);
 
@@ -20,6 +20,9 @@ const els = {
   totals: $('#totals'),
   buffer: $('#buffer'),
   checkpoints: $('#checkpoints'),
+  bdCp: $('#bd-cp'),
+  bdStep: $('#bd-step'),
+  breakdown: $('#breakdown'),
   storage: $('#storage'),
   notes: $('#notes'),
   healthDot: $('#health-dot'),
@@ -367,6 +370,7 @@ function resetOutput() {
   els.checkpoints.innerHTML = '<span class="muted">尚无</span>';
   els.storage.innerHTML = '<span class="muted">—</span>';
   els.notes.innerHTML = '';
+  resetBreakdown();
 }
 
 els.scrub.oninput = () => { step = Number(els.scrub.value); render(); };
@@ -434,7 +438,8 @@ function render() {
       const rel = c.released.length ? `释放缓存 ${c.released.map((r) => `${r.channel}#${r.seq}`).join('、')}` : '无缓存';
       return `<div class="cp-item">
         <div class="cp-head"><span class="badge published">CP ${c.id} 已发布</span>
-        <span class="cp-range">封存于事件 #${c.sealedAtEventIndex}；纳入 ${ranges}；${rel}</span></div>
+        <span class="cp-range">封存于事件 #${c.sealedAtEventIndex}；纳入 ${ranges}；${rel}</span>
+        <button class="btn btn-mini" data-bd-cp="${c.id}" title="以该完整发布检查点为分界，分解当前累计值来源">🧩 来源分解</button></div>
         <b>${fmt(c.total)}</b></div>`;
     }).join('');
   }
@@ -459,6 +464,153 @@ function render() {
   els.notes.innerHTML = f.notes.length
     ? f.notes.map((t) => `<li>${t}</li>`).join('')
     : '<li class="muted">（本步无附加说明）</li>';
+
+  refreshBreakdown();
+}
+
+// ---- 累计值来源分解 ----
+let bdState = { cpId: null, stepIndex: null };
+
+function resetBreakdown() {
+  bdState = { cpId: null, stepIndex: null };
+  els.bdCp.innerHTML = '';
+  els.bdStep.innerHTML = '';
+  els.breakdown.className = 'muted';
+  els.breakdown.innerHTML = '整段回放后在此选择已完整发布的检查点与步骤';
+}
+
+els.bdCp.onchange = () => {
+  bdState.cpId = els.bdCp.value === '' ? null : Number(els.bdCp.value);
+  renderBreakdown();
+};
+els.bdStep.onchange = () => {
+  bdState.stepIndex = els.bdStep.value === '' ? null : Number(els.bdStep.value);
+  renderBreakdown();
+};
+// 检查点卡片上的「来源分解」入口：选中该检查点，步骤默认取当前查看步
+els.checkpoints.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-bd-cp]');
+  if (!btn || !current) return;
+  bdState.cpId = Number(btn.dataset.bdCp);
+  bdState.stepIndex = step;
+  refreshBreakdown();
+});
+
+function defaultCpFor(frame) {
+  // 故障重开后的帧默认选中恢复采用的检查点；否则选最新已发布检查点
+  const rc = frame.recoveryStart?.checkpoint;
+  if (rc != null && frame.checkpoints.some((c) => c.id === rc)) return rc;
+  return frame.checkpoints.length ? frame.checkpoints[frame.checkpoints.length - 1].id : null;
+}
+
+function refreshBreakdown() {
+  if (!current) { resetBreakdown(); return; }
+
+  // 分解步骤以下拉所选为准（跨主时间轴拖动保持稳定），首次进入跟随当前查看步
+  let s = Number.isInteger(bdState.stepIndex) && bdState.stepIndex >= 0 && bdState.stepIndex < current.frames.length
+    ? bdState.stepIndex
+    : step;
+
+  // 检查点须在所选步骤那一帧已完整发布；步骤不得早于封存步骤。至多迭代两轮收敛
+  let cpVal = null;
+  let sealIdx = null;
+  for (let pass = 0; pass < 2; pass++) {
+    const fr = current.frames[s];
+    const cps = fr.checkpoints;
+    cpVal = cps.some((c) => c.id === bdState.cpId)
+      ? bdState.cpId
+      : defaultCpFor(fr);
+    sealIdx = cpVal == null ? null : cps.find((c) => c.id === cpVal)?.sealedAtEventIndex ?? null;
+    const clamped = Number.isInteger(sealIdx) ? Math.max(s, sealIdx) : s;
+    if (clamped === s) break;
+    s = clamped;
+  }
+  bdState.cpId = cpVal;
+  bdState.stepIndex = s;
+
+  // 检查点下拉：列出所选步骤那一帧可见的已完整发布检查点；半成品快照永不出现
+  const cps = current.frames[s].checkpoints;
+  els.bdCp.innerHTML =
+    (cps.length ? '' : '<option value="">（无已发布检查点）</option>') +
+    cps.map((c) => `<option value="${c.id}"${c.id === cpVal ? ' selected' : ''}>检查点 ${c.id}（封存于事件 #${c.sealedAtEventIndex}）</option>`).join('');
+
+  // 步骤下拉：列出全部步；故障冻结步与早于封存步禁用
+  els.bdStep.innerHTML = current.frames.map((fr, i) => {
+    const frozen = fr.alive === false;
+    const beforeSeal = Number.isInteger(sealIdx) && i < sealIdx;
+    const disabled = frozen || beforeSeal;
+    return `<option value="${i}"${i === s ? ' selected' : ''}${disabled ? ' disabled' : ''}>步骤 #${i}${frozen ? '（故障冻结）' : beforeSeal ? '（早于封存）' : ''}</option>`;
+  }).join('');
+
+  renderBreakdown();
+}
+
+function rangeText(ranges) {
+  if (!ranges.length) return '—';
+  return ranges.map((r) => (r.first === r.last ? `#${r.first}` : `#${r.first}–#${r.last}`)).join('、');
+}
+
+function renderBreakdown() {
+  if (!current || bdState.cpId == null || !Number.isInteger(bdState.stepIndex)) {
+    els.breakdown.className = 'muted';
+    els.breakdown.innerHTML = '请选择已完整发布的检查点与不早于它的步骤';
+    return;
+  }
+  const res = sourceBreakdown(current, bdState.cpId, bdState.stepIndex);
+  if (!res.ok) {
+    // 明确原因，且不残留旧分解
+    els.breakdown.className = 'bd-reason';
+    els.breakdown.innerHTML =
+      `⛔ 无法生成来源分解：${res.reason}` +
+      (res.detail ? `<div class="muted" style="margin-top:4px">${res.detail}</div>` : '') +
+      ` <span class="code">[${res.code}]</span>`;
+    return;
+  }
+
+  const rows = res.channels.map((x) => {
+    const items = x.post.items.length
+      ? x.post.items.map((it) => `#${it.seq}=${fmt(it.value)}`).join('、')
+      : '<span class="muted">—</span>';
+    const buffered = x.bufferedSeqs.length
+      ? `<span class="muted">（缓存未释放：${x.bufferedSeqs.map((s) => `#${s}`).join('、')}，两部分均不含）</span>`
+      : '';
+    const mark = x.matches ? '<span class="bd-ok">✓</span>' : '<span class="bd-bad">✗</span>';
+    return `<tr>
+      <td>通道 ${x.channel}</td>
+      <td><span class="bd-seq">${x.sealed.range ? `#${x.sealed.range.first}–#${x.sealed.range.last}` : '—'}</span></td>
+      <td class="bd-num">${fmt(x.sealed.total)}</td>
+      <td><span class="bd-seq">${rangeText(x.post.ranges)}</span></td>
+      <td class="bd-items">${items}</td>
+      <td class="bd-num">${fmt(x.post.total)}</td>
+      <td class="bd-num">${fmt(x.combined)}</td>
+      <td class="bd-num">${fmt(x.current)}</td>
+      <td class="bd-num">${mark}</td>
+      <td>${buffered}</td>
+    </tr>`;
+  }).join('');
+
+  const verdict = res.matches
+    ? '<span class="bd-ok">✓ 核对一致</span>'
+    : `<span class="bd-bad">✗ 差异 ${fmt(res.diff)}</span>`;
+  const recoveryNote = res.recoveredFrom
+    ? `<p class="bd-note">↻ 本分界为故障重开（事件 #${res.reopenEventIndex}）恢复采用的完整发布检查点；重开前后相同序号只计一次，半完成快照不作为来源。</p>`
+    : '';
+
+  els.breakdown.className = '';
+  els.breakdown.innerHTML =
+    `<table class="bd-table">
+      <thead><tr>
+        <th>通道</th><th>封存序号范围</th><th class="bd-num">封存累计</th>
+        <th>检查点后纳入序号</th><th>逐笔增量</th><th class="bd-num">增量小计</th>
+        <th class="bd-num">两部分合计</th><th class="bd-num">当前累计</th><th class="bd-num">核对</th><th></th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="bd-total">
+      <span class="formula">封存 <b>${fmt(res.sealedTotal)}</b> ＋ 检查点后增量 <b>${fmt(res.postTotal)}</b> ＝ 合计 <b>${fmt(res.combinedTotal)}</b>；当前累计 <b>${fmt(res.currentTotal)}</b></span>
+      ${verdict}
+    </div>
+    ${recoveryNote}`;
 }
 
 function fmt(x) { return Number.isInteger(x) ? String(x) : String(Number(x.toFixed(6))); }

@@ -103,6 +103,19 @@
       </div>
 
       <div class="card">
+        <h3>累计值来源分解</h3>
+        <div class="breakdown-bar">
+          <label>检查点
+            <select id="bd-cp"></select>
+          </label>
+          <label>步骤（不早于封存步骤）
+            <select id="bd-step"></select>
+          </label>
+        </div>
+        <div id="breakdown" class="muted">整段回放后在此选择已完整发布的检查点与步骤</div>
+      </div>
+
+      <div class="card">
         <h3>Worker 持久化层（IndexedDB）</h3>
         <div id="storage" class="muted">—</div>
       </div>
