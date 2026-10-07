@@ -1,0 +1,16 @@
+{
+  "name": "abyss-checkpoint-replay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "深海探测阵列 · 屏障对齐检查点回放器",
+  "scripts": {
+    "start": "node server.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/",
+    "verify": "node scripts/verify.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

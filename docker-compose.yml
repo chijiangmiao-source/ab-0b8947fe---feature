@@ -1,0 +1,36 @@
+# 深海探测阵列 · 检查点回放器 —— Compose 编排
+# 可配置宿主端口：WEB_PORT=9090 docker compose up --build
+# verify 服务针对屏障、恢复与错误边界执行：代码测试 + 页面构建 + HTTP 冒烟，
+# 运行结束后退出，并以退出码（0 成功 / 非零失败）报告结果：
+#   docker compose run --rm verify
+services:
+  web:
+    build:
+      context: .
+      target: web
+    image: abyss-checkpoint-web
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: abyss-checkpoint-verify
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      WEB_URL: "http://web:8080"
+    # 覆盖默认 restart：验证服务必须“运行后退出”，由退出码报告结果
+    restart: "no"

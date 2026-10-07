@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>深海探测阵列 · 屏障对齐检查点回放器</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🌊</span>
+      <div>
+        <h1>深海探测阵列 · 检查点回放器</h1>
+        <p class="sub">屏障对齐 · 三阶段持久化（意图 → 快照+输入序号 → 发布）· 崩溃重开去重</p>
+      </div>
+    </div>
+    <div class="health"><span id="health-dot" class="dot"></span><span id="health-text">健康检查中…</span></div>
+  </header>
+
+  <main class="layout">
+    <!-- 左：编排 -->
+    <section class="panel editor-panel">
+      <div class="panel-head">
+        <h2>事件编排（按捕获顺序）</h2>
+        <div class="ch-pick">
+          <label>输入通道
+            <select id="channels">
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </label>
+          <span id="event-count" class="muted"></span>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button data-add="data" class="btn">＋数据</button>
+        <button data-add="barrier" class="btn">＋屏障</button>
+        <button data-add="crash" class="btn warn">＋故障</button>
+        <button data-add="reopen" class="btn">＋重开</button>
+        <span class="sep"></span>
+        <select id="preset" title="载入示例">
+          <option value="">载入示例…</option>
+          <option value="basic">两通道基本对齐</option>
+          <option value="buffer">缓存与按原序释放</option>
+          <option value="crash-snap">快照后故障 / 重开去重</option>
+          <option value="crash-intent">意图后故障</option>
+          <option value="seqgap">错误：跳号</option>
+          <option value="dupbarrier">错误：重复屏障</option>
+          <option value="earlyrelease">错误：交叉对齐</option>
+        </select>
+      </div>
+
+      <div class="event-table-wrap">
+        <table class="event-table">
+          <thead>
+            <tr><th>#</th><th>类型</th><th>通道</th><th>序号/检查点</th><th>值</th><th>注入阶段</th><th></th></tr>
+          </thead>
+          <tbody id="event-rows"></tbody>
+        </table>
+      </div>
+
+      <div id="validation" class="validation hidden"></div>
+
+      <div class="run-bar">
+        <button id="run" class="btn primary">▶ 整段回放</button>
+        <button id="clear" class="btn">清空</button>
+        <span id="worker-state" class="muted"></span>
+      </div>
+    </section>
+
+    <!-- 右：回放 -->
+    <section class="panel replay-panel">
+      <div class="panel-head">
+        <h2>回放与通道状态</h2>
+        <div class="step-nav">
+          <button id="prev" class="btn">‹ 上一步</button>
+          <button id="play" class="btn">自动播放</button>
+          <button id="next" class="btn">下一步 ›</button>
+        </div>
+      </div>
+
+      <input id="scrub" type="range" min="0" max="0" value="0" step="1" disabled />
+
+      <div id="stage" class="stage empty">尚未运行 —— 编排事件后点击「整段回放」</div>
+
+      <div class="grid-two">
+        <div class="card">
+          <h3>当前累计值</h3>
+          <div id="totals"></div>
+        </div>
+        <div class="card">
+          <h3>缓存区</h3>
+          <div id="buffer"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>检查点</h3>
+        <div id="checkpoints" class="muted">尚无</div>
+      </div>
+
+      <div class="card">
+        <h3>Worker 持久化层（IndexedDB）</h3>
+        <div id="storage" class="muted">—</div>
+      </div>
+
+      <div class="card">
+        <h3>本步日志</h3>
+        <ul id="notes" class="notes"></ul>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    每通道数据序号连续递增 · 屏障先到则缓存 · 全通道对齐才封存 · 仅采用带发布标记的最新检查点
+  </footer>
+
+  <script type="module" src="./app.mjs"></script>
+</body>
+</html>
