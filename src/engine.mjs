@@ -33,6 +33,15 @@ export class ValidationError extends Error {
   }
 }
 
+/** 来源分解失败：分界无法建立时抛出，code 说明明确原因（UI 不得残留旧分解） */
+export class BreakdownError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = 'BreakdownError';
+    this.code = code;
+  }
+}
+
 /** 结构校验：通道数、事件数、字段合法性。返回标准化事件。 */
 export function normalizePlan(plan) {
   const channels = Number(plan?.channels);
@@ -131,6 +140,7 @@ export function replay(plan) {
   let phase = 'idle'; // idle | intent | snapshot | published | crashed
   let phaseDetail = null;
   let recoveryStart = null;
+  let lastReopenIndex = -1; // 截至当前帧最后一次 REOPEN 的事件下标（-1 表示本世代未发生过重开）
 
   const bufferView = () =>
     buffer.map((b) => ({
@@ -149,6 +159,7 @@ export function replay(plan) {
   const commit = (frame) => {
     frame.total = totals.total;
     frame.perChannel = totals.perChannel.slice();
+    frame.appliedSeq = lastAppliedSeq.slice();
     frame.nextSeq = expectedSeq.slice();
     frame.buffered = bufferView();
     frame.alignment = alignmentView();
@@ -197,11 +208,13 @@ export function replay(plan) {
       phase,
       phaseDetail,
       recoveryStart,
+      lastReopenIndex,
       persistence: [],
       cleanup: null,
       crashed: false,
       reopened: false,
       skippedDead: false,
+      appliedThisFrame: [], // 本帧实际纳入累计值的数据（直接入账或缓存释放），缓存未释放者不在其中
       notes: [],
     };
 
@@ -237,6 +250,7 @@ export function replay(plan) {
       }
       alive = true;
       armedCrash = null;
+      lastReopenIndex = i;
       // 清理存储层：无 published 配对的 snapshot、所有 intent
       const publishedCp = new Set(checkpoints.map((c) => c.id));
       const deleted = [];
@@ -289,6 +303,7 @@ export function replay(plan) {
       frame.buffered = [];
       frame.reopened = true;
       frame.recoveryStart = recoveryStart;
+      frame.lastReopenIndex = i;
       frame.notes.push('REOPEN：' + (deleted.length ? `废弃 ${deleted.length} 个未完成写入（${deleted.join('、')}）；` : '') + recoveryStart.reason);
       commit(frame);
       continue;
@@ -316,6 +331,7 @@ export function replay(plan) {
       } else {
         applyData(totals, ev.channel, ev.value);
         lastAppliedSeq[ev.channel] = ev.seq;
+        frame.appliedThisFrame.push({ channel: ev.channel, seq: ev.seq, value: ev.value });
       }
       commit(frame);
       continue;
@@ -431,6 +447,7 @@ export function replay(plan) {
         applyData(totals, b.event.channel, b.event.value);
         lastAppliedSeq[b.event.channel] = b.event.seq;
         sealed.released.push({ channel: b.event.channel, seq: b.event.seq, value: b.event.value });
+        frame.appliedThisFrame.push({ channel: b.event.channel, seq: b.event.seq, value: b.event.value });
       }
       if (sealed.released.length) {
         frame.notes.push(
@@ -482,4 +499,192 @@ export function finalState(plan) {
   const r = replay(plan);
   const last = r.frames[r.frames.length - 1];
   return { channels: r.channels, total: last.total, perChannel: last.perChannel, checkpoints: r.checkpoints };
+}
+
+/**
+ * 来源分解：在指定步骤（frameIndex）处，把“当前累计值”按某一已完整发布检查点切成两部分——
+ *   A. 封存部分：该检查点快照封存的各通道序号范围与累计值；
+ *   B. 检查点之后实际纳入部分：每通道 (封存序号, 当前已应用连续序号] 内真正入账的序号与增量，
+ *      含封存同帧按原序释放的缓存（它们在快照之后，属于“其后新纳入”），不含仍在缓存中尚未释放者。
+ * 分界只依据：每通道已应用的连续序号（appliedSeq）+ 已发布检查点快照重建。
+ *
+ * 校验失败抛 BreakdownError（携带明确 code），调用方收到后必须清空旧分解、只展示原因：
+ *   STEP_BEFORE_CHECKPOINT  所选步骤早于该检查点封存事件
+ *   CHECKPOINT_INCOMPLETE   该检查点在所选步骤处尚未完整发布（半完成快照不得成为来源）
+ *   STEP_FROZEN_AT_ERROR    所选步骤已在首个错误处冻结（故障态/崩溃帧，累计值不代表真实状态）
+ *   CHECKPOINT_NOT_RECOVERY 快照阶段故障并重开后，只能针对恢复采用的完整检查点生成分解
+ *   BAD_BREAKDOWN_ARGS      参数非法（步骤越界、检查点不存在）
+ */
+export function breakdownSources(replayResult, checkpointId, frameIndex) {
+  const cpId = Number(checkpointId);
+  const idx = Number(frameIndex);
+  const channels = replayResult?.channels;
+  const frames = replayResult?.frames;
+  if (!Number.isInteger(channels) || !Array.isArray(frames) || !frames.length) {
+    throw new BreakdownError('缺少回放结果，无法建立来源分界', 'BAD_BREAKDOWN_ARGS');
+  }
+  if (!Number.isInteger(cpId) || cpId < 1) {
+    throw new BreakdownError(`检查点编号非法：${checkpointId}`, 'BAD_BREAKDOWN_ARGS');
+  }
+  if (!Number.isInteger(idx) || idx < 0 || idx >= frames.length) {
+    throw new BreakdownError(`步骤必须是 0–${frames.length - 1} 之间的整数，收到 ${frameIndex}`, 'BAD_BREAKDOWN_ARGS');
+  }
+
+  // 终态已发布检查点清单即“完整检查点”的权威集合：半完成快照从不进入该清单
+  const publishedIds = new Set((replayResult.checkpoints || []).map((c) => c.id));
+  if (!publishedIds.has(cpId)) {
+    throw new BreakdownError(
+      `检查点 ${cpId} 不是完整发布的检查点（半完成快照及其数据不得成为来源）`,
+      'CHECKPOINT_INCOMPLETE'
+    );
+  }
+
+  const frame = frames[idx];
+
+  // 所选步骤已在首个错误处冻结：故障帧及其后、重开前的输入暂存帧（phase 均为 crashed）
+  // 运行态已中断、累计值不代表真实状态，不能对其做分解。
+  if (frame.crashed || frame.skippedDead || frame.phase === 'crashed') {
+    throw new BreakdownError(
+      frame.skippedDead
+        ? `步骤 #${idx} 处于故障冻结期（崩溃后、重开前，输入仅被上游暂存），累计值不代表真实状态，不能展示来源分解`
+        : `步骤 #${idx} 处于故障冻结态（进程在首个错误处中断），累计值不代表真实状态，不能展示来源分解`,
+      'STEP_FROZEN_AT_ERROR'
+    );
+  }
+
+  // 该检查点在所选步骤处必须已完整发布（帧检查点清单按发布顺序追加，重开也不摘除已发布项）。
+  // 能走到这里说明它终态确为完整检查点；帧清单中缺失只可能是该步早于其封存发布事件。
+  const cpViewAtFrame = frame.checkpoints.find((c) => c.id === cpId);
+  if (!cpViewAtFrame) {
+    throw new BreakdownError(
+      `所选步骤 #${idx} 早于检查点 ${cpId} 的封存发布事件 #${sealedEventIndex(
+        replayResult,
+        cpId
+      )}：该检查点在此步尚未完整发布`,
+      'STEP_BEFORE_CHECKPOINT'
+    );
+  }
+
+  // 快照阶段故障并重开后：只允许针对“恢复采用的完整检查点”分解。
+  // 精确判据：该次重开的清理清单中删除过半成品 snapshot:* —— 即发生过快照阶段故障；
+  // 此时半完成快照及其数据不得成为来源，重开世代内只认恢复起点检查点。
+  if (frame.lastReopenIndex >= 0) {
+    const reopenFrame = frames[frame.lastReopenIndex];
+    const deleted = reopenFrame?.cleanup?.deleted || [];
+    const hadHalfSnapshot = deleted.some((k) => k.startsWith('snapshot:'));
+    if (hadHalfSnapshot) {
+      const recoveryCp = reopenFrame?.recoveryStart?.checkpoint ?? null;
+      if (recoveryCp == null || recoveryCp !== cpId) {
+        throw new BreakdownError(
+          recoveryCp == null
+            ? `步骤 #${idx} 位于快照阶段故障后的重开（事件 #${frame.lastReopenIndex}）之后，本次恢复未采用任何完整检查点，半完成快照不得成为来源，无法分解`
+            : `步骤 #${idx} 位于快照阶段故障后的重开（事件 #${frame.lastReopenIndex}）之后：只能针对恢复实际采用的完整检查点 ${recoveryCp} 生成分解，检查点 ${cpId} 不是本次恢复的来源`,
+          'CHECKPOINT_NOT_RECOVERY'
+        );
+      }
+    }
+  }
+
+  // 双保险：显式比较封存事件下标，步骤不得早于检查点
+  const sealedAt = cpViewAtFrame.sealedAtEventIndex;
+  if (idx < sealedAt) {
+    throw new BreakdownError(
+      `所选步骤 #${idx} 早于检查点 ${cpId} 的封存事件 #${sealedAt}`,
+      'STEP_BEFORE_CHECKPOINT'
+    );
+  }
+
+  return buildBreakdown(replayResult, cpViewAtFrame, frame);
+}
+
+function sealedEventIndex(replayResult, cpId) {
+  const c = (replayResult.checkpoints || []).find((x) => x.id === cpId);
+  return c ? c.sealedAtEventIndex : Number.POSITIVE_INFINITY;
+}
+
+function emptyRange() {
+  return { firstSeq: null, lastSeq: null, seqs: [], items: [], total: 0 };
+}
+
+/** 依据快照与每通道已应用连续序号，从帧流重建两部分分界（不读取任何缓存未释放数据）。 */
+function buildBreakdown(replayResult, cpView, frame) {
+  const channels = replayResult.channels;
+  const cpId = cpView.id;
+  const sealedAt = cpView.sealedAtEventIndex;
+
+  const channels_out = [];
+  let sealedGrand = 0;
+  let afterGrand = 0;
+
+  for (let c = 1; c <= channels; c++) {
+    // —— A. 封存部分：序号范围 [1, inputSeq]，累计值直接取自已发布快照（权威封存值）——
+    const sealedSeq = cpView.inputSeq[c]; // 检查点封存的该通道最后输入序号
+    const sealedFirst = sealedSeq > 0 ? 1 : null;
+    const sealedLast = sealedSeq > 0 ? sealedSeq : null;
+    const sealedSeqs = sealedSeq > 0 ? rangeList(1, sealedSeq) : [];
+    const sealedTotal = cpView.perChannel[c];
+    sealedGrand += sealedTotal;
+
+    // —— B. 检查点之后实际纳入：序号区间 (封存序号, 当前已应用连续序号] ——
+    const appliedNow = frame.appliedSeq[c]; // 当前累计值中该通道已应用的连续最后序号
+    let afterRange = emptyRange();
+    if (appliedNow > sealedSeq) {
+      const firstSeq = sealedSeq + 1;
+      const lastSeq = appliedNow;
+      // 收集下界：封存事件之后；若发生过重开则只看最后一次重开（含）之后——
+      // 重开会把累计值重置回快照，崩溃前旧世代的入账已被回滚，绝不能出现在当前累计的来源中。
+      const fiStart = Math.max(sealedAt, frame.lastReopenIndex);
+      // 从帧流重建该区间真正入账的项（appliedThisFrame）：
+      // 封存同帧的缓存释放发生在发布之后，时间上属于“检查点后”，纳入 B；
+      // 仍在缓存中的数据不在任何帧的 appliedThisFrame 中，天然被排除；
+      // 故障冻结帧、故障态暂存帧不产生 appliedThisFrame，废弃世代的同序号不会混入。
+      const items = [];
+      for (let fi = fiStart; fi <= frame.index; fi++) {
+        for (const a of replayResult.frames[fi].appliedThisFrame) {
+          if (a.channel === c && a.seq >= firstSeq && a.seq <= lastSeq) items.push(a);
+        }
+      }
+      // 按序号去重（保留当前世代内首次入账）：重开前后相同序号只计一次，不视为重复贡献。
+      const bySeq = new Map();
+      for (const it of items) if (!bySeq.has(it.seq)) bySeq.set(it.seq, it);
+      const seqs = [...bySeq.keys()].sort((a, b) => a - b);
+      afterRange = {
+        firstSeq,
+        lastSeq,
+        seqs,
+        items: seqs.map((s) => ({ seq: s, value: bySeq.get(s).value })),
+        total: seqs.reduce((m, s) => m + bySeq.get(s).value, 0),
+      };
+      afterGrand += afterRange.total;
+    }
+
+    channels_out.push({
+      channel: c,
+      sealed: { firstSeq: sealedFirst, lastSeq: sealedLast, seqs: sealedSeqs, total: sealedTotal },
+      after: afterRange,
+    });
+  }
+
+  const combinedGrand = sealedGrand + afterGrand;
+  const currentGrand = frame.total;
+  const buffered = frame.buffered.map((b) => ({ channel: b.channel, seq: b.seq, value: b.value }));
+  // 浮点容差核对：封存小计按通道求和、当前累计按事件交错累加，加法顺序不同，允许极小尾差
+  const diff = currentGrand - combinedGrand;
+  const eps = 1e-9 * Math.max(1, Math.abs(currentGrand), Math.abs(combinedGrand));
+
+  return {
+    checkpoint: cpId,
+    frameIndex: frame.index,
+    sealedAtEventIndex: sealedAt,
+    reopened: frame.lastReopenIndex >= 0,
+    lastReopenIndex: frame.lastReopenIndex,
+    channels: channels_out,
+    sealedGrand,
+    afterGrand,
+    combinedGrand,
+    currentGrand,
+    matched: Math.abs(diff) <= eps,
+    difference: diff,
+    bufferedExcluded: buffered,
+  };
 }

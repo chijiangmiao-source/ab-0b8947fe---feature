@@ -1,5 +1,5 @@
-// app.mjs — 页面逻辑：事件编排、Worker 回放、单步查看
-import { replay, ValidationError, MAX_EVENTS } from './engine.mjs';
+// app.mjs — 页面逻辑：事件编排、Worker 回放、单步查看、来源分解
+import { replay, breakdownSources, BreakdownError, ValidationError, MAX_EVENTS } from './engine.mjs';
 
 const $ = (s) => document.querySelector(s);
 
@@ -20,6 +20,9 @@ const els = {
   totals: $('#totals'),
   buffer: $('#buffer'),
   checkpoints: $('#checkpoints'),
+  breakdownCard: $('#breakdown-card'),
+  breakdown: $('#breakdown'),
+  bdClose: $('#bd-close'),
   storage: $('#storage'),
   notes: $('#notes'),
   healthDot: $('#health-dot'),
@@ -264,6 +267,9 @@ let current = null;
 let step = 0;
 let playTimer = null;
 let useWorker = false;
+let breakdownCp = null; // 当前来源分解针对的已发布检查点编号；null 表示未开启
+
+els.bdClose.onclick = () => { breakdownCp = null; render(); };
 
 function plan() {
   return { channels: Number(els.channels.value), events: events.map((e) => ({ ...e })) };
@@ -344,6 +350,7 @@ els.run.onclick = async () => {
     }
     current = result;
     step = result.frames.length - 1;
+    breakdownCp = null;
     render();
   } catch (err) {
     if (err.validation || err instanceof ValidationError) {
@@ -358,6 +365,7 @@ els.run.onclick = async () => {
 // ---- 单步渲染 ----
 function resetOutput() {
   current = null;
+  breakdownCp = null;
   els.scrub.disabled = true;
   els.scrub.max = 0;
   els.stage.className = 'stage empty';
@@ -365,6 +373,7 @@ function resetOutput() {
   els.totals.innerHTML = '';
   els.buffer.innerHTML = '';
   els.checkpoints.innerHTML = '<span class="muted">尚无</span>';
+  resetBreakdown();
   els.storage.innerHTML = '<span class="muted">—</span>';
   els.notes.innerHTML = '';
 }
@@ -432,17 +441,36 @@ function render() {
         .map((r) => r.lastSeq == null ? `通道${r.channel}: —` : `通道${r.channel}: #${r.firstSeq}–#${r.lastSeq}`)
         .join('；');
       const rel = c.released.length ? `释放缓存 ${c.released.map((r) => `${r.channel}#${r.seq}`).join('、')}` : '无缓存';
+      const active = breakdownCp === c.id;
       return `<div class="cp-item">
-        <div class="cp-head"><span class="badge published">CP ${c.id} 已发布</span>
-        <span class="cp-range">封存于事件 #${c.sealedAtEventIndex}；纳入 ${ranges}；${rel}</span></div>
-        <b>${fmt(c.total)}</b></div>`;
+        <div class="cp-head">
+          <span class="badge published">CP ${c.id} 已发布</span>
+          <span class="cp-range">封存于事件 #${c.sealedAtEventIndex}；纳入 ${ranges}；${rel}</span>
+        </div>
+        <div class="cp-foot">
+          <b>${fmt(c.total)}</b>
+          <button class="btn mini ${active ? 'primary' : ''}" data-breakdown="${c.id}">
+            ${active ? '取消来源分解' : '🔀 来源分解'}
+          </button>
+        </div>
+      </div>`;
     }).join('');
+    els.checkpoints.querySelectorAll('[data-breakdown]').forEach((btn) => {
+      btn.onclick = () => {
+        const id = Number(btn.dataset.breakdown);
+        breakdownCp = breakdownCp === id ? null : id;
+        render();
+      };
+    });
   }
   if (f.recoveryStart) {
     const r = f.recoveryStart;
-    els.checkpoints.innerHTML +=
+    // 用 insertAdjacentHTML 追加，避免 innerHTML += 重建节点而冲掉来源分解按钮的事件监听
+    els.checkpoints.insertAdjacentHTML(
+      'beforeend',
       `<div class="cp-item" style="border-top:1px solid var(--line);margin-top:6px;padding-top:8px">
-        <span>↻ 恢复起点：${r.checkpoint == null ? '空状态（无已发布检查点）' : `检查点 ${r.checkpoint} 之后（事件 #${r.afterEventIndex} 之后）`}，各通道序号 ${JSON.stringify(r.inputSeq.slice(1))}</span></div>`;
+        <span>↻ 恢复起点：${r.checkpoint == null ? '空状态（无已发布检查点）' : `检查点 ${r.checkpoint} 之后（事件 #${r.afterEventIndex} 之后）`}，各通道序号 ${JSON.stringify(r.inputSeq.slice(1))}</span></div>`
+    );
   }
 
   // 存储层
@@ -459,6 +487,89 @@ function render() {
   els.notes.innerHTML = f.notes.length
     ? f.notes.map((t) => `<li>${t}</li>`).join('')
     : '<li class="muted">（本步无附加说明）</li>';
+
+  // 来源分解（依据当前步与所选检查点实时重建）
+  renderBreakdown();
+}
+
+// ---- 来源分解面板 ----
+function resetBreakdown() {
+  els.breakdownCard.classList.add('hidden');
+  els.breakdown.innerHTML = '';
+}
+
+function rangeText(r) {
+  if (r.lastSeq == null) return '<span class="muted">—（无）</span>';
+  return `#${r.firstSeq}–#${r.lastSeq}`;
+}
+
+function seqText(seqs) {
+  if (!seqs.length) return '<span class="muted">无</span>';
+  // 序号较多时折叠展示，避免过长
+  return seqs.map((s) => `#${s}`).join('、');
+}
+
+function renderBreakdown() {
+  if (!current || breakdownCp == null) { resetBreakdown(); return; }
+  // 该检查点已不在当前步的已发布清单（例如拖到更早的步），仍然尝试分解以拿到明确原因
+  let b = null;
+  let err = null;
+  try {
+    b = breakdownSources(current, breakdownCp, step);
+  } catch (e) {
+    if (e instanceof BreakdownError) err = e;
+    else { resetBreakdown(); return; }
+  }
+
+  els.breakdownCard.classList.remove('hidden');
+
+  if (err) {
+    // 明确原因，不残留任何旧分解内容
+    els.breakdown.innerHTML =
+      `<div class="bd-err">⛔ <b>无法按检查点 ${breakdownCp} 分解当前步 #${step}</b>
+        <div class="bd-msg">${err.message}</div>
+        <div class="muted">[code=${err.code}]</div></div>`;
+    return;
+  }
+
+  const rows = b.channels.map((ch) => {
+    const s = ch.sealed, a = ch.after;
+    return `<tr>
+      <td>通道 ${ch.channel}</td>
+      <td>${rangeText(s)}<div class="seqs">${seqText(s.seqs)}</div></td>
+      <td class="num sealed-val">${fmt(s.total)}</td>
+      <td>${rangeText(a)}<div class="seqs">${a.items.length ? a.items.map((x) => `#${x.seq}=${fmt(x.value)}`).join('、') : '<span class="muted">无</span>'}</div></td>
+      <td class="num after-val">${fmt(a.total)}</td>
+    </tr>`;
+  }).join('');
+
+  const bufferedNote = b.bufferedExcluded.length
+    ? `<div class="bd-buf">缓存中尚未释放（不计入任一部分）：${b.bufferedExcluded.map((x) => `通道${x.channel}#${x.seq}`).join('、')}</div>`
+    : '<div class="muted">缓存为空：不存在尚未释放、可能被误算的数据。</div>';
+
+  const reopenNote = b.reopened
+    ? `<div class="bd-reopen">↻ 本步位于重开（事件 #${b.lastReopenIndex}）之后，仅统计恢复采用检查点 ${b.checkpoint} 之后当前重放世代实际纳入的序号；重开前相同序号不重复计。</div>`
+    : '';
+
+  const matchCls = b.matched ? 'bd-ok' : 'bd-bad';
+  const matchIcon = b.matched ? '✓' : '⚠';
+  const matchText = b.matched
+    ? `两部分合计 ${fmt(b.combinedGrand)} ＝ 当前累计值 ${fmt(b.currentGrand)}，核对一致`
+    : `两部分合计 ${fmt(b.combinedGrand)} ≠ 当前累计值 ${fmt(b.currentGrand)}，差额 ${fmt(b.difference)}`;
+
+  els.breakdown.innerHTML =
+    `<div class="bd-title">以已完整发布的 <b>检查点 ${b.checkpoint}</b>（封存于事件 #${b.sealedAtEventIndex}）为界 · 当前步 #${b.frameIndex}</div>
+     ${reopenNote}
+     <table class="bd-table">
+       <thead><tr><th>通道</th><th>封存序号范围</th><th>封存累计</th><th>检查点后实际纳入序号</th><th>增量</th></tr></thead>
+       <tbody>${rows}</tbody>
+     </table>
+     <div class="bd-sum">
+       <span>封存小计 <b class="sealed-val">${fmt(b.sealedGrand)}</b></span>
+       <span>检查点后增量小计 <b class="after-val">${fmt(b.afterGrand)}</b></span>
+     </div>
+     ${bufferedNote}
+     <div class="bd-check ${matchCls}">${matchIcon} ${matchText}</div>`;
 }
 
 function fmt(x) { return Number.isInteger(x) ? String(x) : String(Number(x.toFixed(6))); }
